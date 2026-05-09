@@ -1,0 +1,130 @@
+ "fulfilled": [],
+    "username": "Fabiok89",
+    "settings": {
+      "timezone": "Europe/Rome",
+      "network": "Polygon"
+
+
+
+      Fazione:
+
+"faction": {
+      "history": {
+        "2025-09-29": {
+          "petXP": 0,
+          "score": 81,
+          "collectivePet": {
+            "totalXP": 6693375,
+            "goalXP": 1890625,
+            "goalReached": true,
+            "streak": 3,
+            "sleeping": false
+          },
+          "results": {
+            "rank": 1041
+          }
+        },
+        "2025-10-06": {
+          "petXP": 0,
+          "score": 39.9,
+          "collectivePet": {
+            "totalXP": 5284760,
+            "goalXP": 2363281,
+            "goalReached": true,
+            "streak": 4,
+            "sleeping": false
+          },
+          "results": {
+            "rank": 1229
+          }
+        },
+        "2025-10-13": {
+          "petXP": 0,
+          "score": 0,
+          "collectivePet": {
+            "totalXP": 10110400,
+            "goalXP": 2954101,
+            "goalReached": true,
+            "streak": 5,
+            "sleeping": false
+          },
+          "results": {
+            "rank": 0
+          }
+        },
+        "2025-10-20": {
+          "petXP": 0,
+          "score": 0,
+          "collectivePet": {
+            "totalXP": 5365675,
+            "goalXP": 3692626,
+            "goalReached": true,
+            "streak": 6,
+            "sleeping": false
+          },
+          "results": {
+            "rank": 0
+          }
+        },
+        "2025-10-27": {
+          "petXP": 0,
+          "score": 0,
+          "collectivePet": {
+            "totalXP": 2989400,
+            "goalXP": 4615783,
+            "goalReached": false,
+            "streak": 6,
+            "sleeping": false
+          }
+        }
+      },
+      "name": "bumpkins",
+      "pledgedAt": 1750332489552,
+      "points": 0,
+      "kitchen": {
+        "week": "2025-10-27",
+        "requests": [
+          {
+            "item": "Kale",
+            "amount": 8,
+            "dailyFulfilled": {}
+          },
+          {
+            "item": "Honey",
+            "amount": 3,
+            "dailyFulfilled": {}
+          },
+          {
+            "item": "Milk",
+            "amount": 3,
+            "dailyFulfilled": {}
+          }
+        ]
+      },
+      "pet": {
+        "week": "2025-10-27",
+        "qualifiesForBoost": false,
+        "requests": [
+          {
+            "food": "Fried Tofu",
+            "quantity": 2,
+            "dailyFulfilled": {}
+          },
+          {
+            "food": "Banana Blast",
+            "quantity": 1,
+            "dailyFulfilled": {}
+          },
+          {
+            "food": "Blue Cheese",
+            "quantity": 1,
+            "dailyFulfilled": {}
+          },
+          {
+            "food": "Juicy Doll",
+            "quantity": 1,
+            "dailyFulfilled": {}
+          }
+        ]
+      }
+    },      

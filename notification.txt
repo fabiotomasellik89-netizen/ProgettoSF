@@ -1,0 +1,481 @@
+import asyncio
+import time
+import logging
+from typing import Callable, Iterable, Dict, List, Tuple
+from notify_format import render_line
+
+from api import fetch_farm_with_user_key
+
+log = logging.getLogger("sflbot")
+
+# Costanti
+PRE_NOTICE_SECONDS = 120  # Notifica 2 minuti prima
+CHECK_INTERVAL = 60  # Controlla ogni minuto
+API_REFRESH_SECONDS = 15 * 60  # Refresh API ogni 15 minuti
+
+class NotificationManager:
+    def __init__(self, chat_ids: Iterable[int], farm_id: str, bot_send: Callable):
+        self.chat_ids = list(chat_ids)
+        self.farm_id = str(farm_id)
+        self.bot_send = bot_send
+        self._timer_task = None
+        self._last_payload = None
+        self._last_fetch_ts = 0.0
+        self.is_running = False
+        
+        # Storage persistente per anti-duplicazione
+        from persistent_state import load_state, save_state
+        self._state = load_state(f"notifications_{farm_id}")
+        if "sent_notifications" not in self._state:
+            self._state["sent_notifications"] = {}
+        
+    async def start(self):
+        """Avvia il sistema di notifiche"""
+        if self.is_running:
+            return
+            
+        self.is_running = True
+        log.info(f"🔔 NotificationManager avviato per farm {self.farm_id}")
+        
+        # Carica payload iniziale
+        try:
+            await self._fetch_payload(force=True)
+        except Exception as e:
+            log.error(f"Errore caricamento iniziale farm {self.farm_id}: {e}")
+        
+        # Avvia loop
+        self._timer_task = asyncio.create_task(self._notification_loop())
+    
+    async def stop(self):
+        """Ferma il sistema"""
+        self.is_running = False
+        if self._timer_task:
+            self._timer_task.cancel()
+            try:
+                await self._timer_task
+            except asyncio.CancelledError:
+                pass
+        log.info(f"NotificationManager fermato per farm {self.farm_id}")
+    
+    async def _notification_loop(self):
+        """Loop principale - controlla ogni minuto"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(CHECK_INTERVAL)
+                
+                if not self.is_running:
+                    break
+                
+                # Fetch payload
+                payload = await self._fetch_payload()
+                if not payload:
+                    continue
+                
+                # Controlla cosa notificare
+                now_ms = int(time.time() * 1000)
+                notifications = self._check_all_items(payload, now_ms)
+                
+                # Invia notifiche
+                if notifications:
+                    await self._send_notifications(notifications, payload)
+                
+                # Pulisci notifiche vecchie (oltre 3 minuti)
+                self._cleanup_old_notifications(now_ms)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Errore nel loop notifiche farm {self.farm_id}: {e}")
+    
+    async def _fetch_payload(self, force=False):
+        """Carica payload con cache"""
+        now = time.time()
+        
+        # Usa cache se valida
+        if not force and self._last_payload and (now - self._last_fetch_ts < API_REFRESH_SECONDS):
+            return self._last_payload
+        
+        try:
+            chat_id = self.chat_ids[0]
+            payload, _, _ = await fetch_farm_with_user_key(self.farm_id, chat_id, force=force)
+            self._last_payload = payload
+            self._last_fetch_ts = now
+            return payload
+        except Exception as e:
+            log.error(f"Errore fetch farm {self.farm_id}: {e}")
+            return self._last_payload or {"farm": {}}
+    
+    def _check_all_items(self, payload: Dict, now_ms: int) -> List[Dict]:
+        """
+        Controlla TUTTI gli item e ritorna lista di notifiche da inviare
+        """
+        notifications = []
+        
+        # 1. NOTIFICHE IMMEDIATE (priorità massima)
+        notifications.extend(self._check_bee_swarms(payload, now_ms))
+        notifications.extend(self._check_mutations(payload, now_ms))
+        notifications.extend(self._check_beehive_full(payload, now_ms))
+        
+        # 2. PRE-NOTIFICHE (2 minuti prima)
+        notifications.extend(self._check_timed_items(payload, now_ms))
+        
+        return notifications
+    
+    def _check_bee_swarms(self, payload: Dict, now_ms: int) -> List[Dict]:
+        """Controlla bee swarm attivi (notifica immediata)"""
+        from mutation_storage import is_bee_swarm_sent, mark_bee_swarm_sent
+        
+        results = []
+        beehives = payload.get("farm", {}).get("beehives", {})
+        
+        for hive_id, hive_data in beehives.items():
+            if not isinstance(hive_data, dict):
+                continue
+            
+            swarm = hive_data.get("swarm")
+            if not swarm:
+                continue
+            
+            # Ha uno swarm attivo
+            if not is_bee_swarm_sent(self.farm_id, hive_id):
+                x = hive_data.get("x")
+                y = hive_data.get("y")
+                coord = f"({x},{y})" if x is not None else f"({hive_id[-4:]})"
+                
+                results.append({
+                    "type": "bee_swarm",
+                    "name": f"Bee Swarm attivo {coord}",
+                    "count": 1,
+                    "time_left_ms": 0
+                })
+                
+                mark_bee_swarm_sent(self.farm_id, hive_id)
+                log.info(f"🐝 BEE SWARM rilevato: {coord}")
+        
+        return results
+    
+    def _check_mutations(self, payload: Dict, now_ms: int) -> List[Dict]:
+        """Controlla mutazioni animali e fiori (notifica immediata)"""
+        from mutation_storage import is_mutation_sent, mark_mutation_sent
+        
+        results = []
+        farm = payload.get("farm", {})
+        
+        # Animali: henHouse + barn
+        for building_key in ["henHouse", "barn"]:
+            building = farm.get(building_key, {})
+            if not isinstance(building, dict):
+                continue
+            
+            animals = building.get("animals", {})
+            for animal_id, animal_data in animals.items():
+                if not isinstance(animal_data, dict):
+                    continue
+                
+                reward = animal_data.get("reward", {})
+                items = reward.get("items", []) if isinstance(reward, dict) else []
+                
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    
+                    mutation_name = item.get("name", "Mutazione")
+                    
+                    if not is_mutation_sent(self.farm_id, animal_id):
+                        results.append({
+                            "type": "mutation",
+                            "name": mutation_name,
+                            "count": 1,
+                            "time_left_ms": 0
+                        })
+                        
+                        mark_mutation_sent(self.farm_id, animal_id, mutation_name)
+                        log.info(f"🧬 MUTAZIONE rilevata: {mutation_name} ({building_key})")
+        
+        # Fiori: flowerBeds
+        flowers_data = farm.get("flowers", {})
+        if isinstance(flowers_data, dict):
+            flower_beds = flowers_data.get("flowerBeds", {})
+            for bed_id, bed_data in flower_beds.items():
+                if not isinstance(bed_data, dict):
+                    continue
+                
+                flower = bed_data.get("flower", {})
+                if not isinstance(flower, dict):
+                    continue
+                
+                reward = flower.get("reward", {})
+                items = reward.get("items", []) if isinstance(reward, dict) else []
+                
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    
+                    mutation_name = item.get("name", "Mutazione Fiore")
+                    
+                    if not is_mutation_sent(self.farm_id, bed_id):
+                        results.append({
+                            "type": "mutation",
+                            "name": mutation_name,
+                            "count": 1,
+                            "time_left_ms": 0
+                        })
+                        
+                        mark_mutation_sent(self.farm_id, bed_id, mutation_name)
+                        log.info(f"🌺 MUTAZIONE FIORE rilevata: {mutation_name}")
+        
+        return results
+    
+    # notifications.py - Correzione CRITICA della funzione _check_beehive_full
+
+    def _check_beehive_full(self, payload: Dict, now_ms: int) -> List[Dict]:
+        """Controlla beehive pieni >= 98% (notifica immediata) - CALCOLO CORRETTO"""
+        from mutation_storage import is_beehive_full_sent, mark_beehive_full_sent
+        
+        results = []
+        
+        # Costante CORRETTA (stessa di alveari.py)
+        BEEHIVE_MAX_HONEY = 68664000  # 68.664M
+        NOTIFICATION_THRESHOLD = BEEHIVE_MAX_HONEY * 0.98  # 98%
+        
+        beehives = payload.get("farm", {}).get("beehives", {})
+        
+        if not beehives:
+            return results
+        
+        for hive_id, hive_data in beehives.items():
+            if not isinstance(hive_data, dict):
+                continue
+            
+            # Leggi produzione REALE
+            honey_data = hive_data.get("honey", {})
+            if not isinstance(honey_data, dict):
+                continue
+                
+            produced = honey_data.get("produced", 0) or 0
+            
+            # Calcola percentuale REALE
+            percent = (produced / BEEHIVE_MAX_HONEY) * 100
+            
+            # LOG DETTAGLIATO per debug
+            log.info(f"🔍 Alveare {hive_id[-6:]}: {produced:,.0f} / {BEEHIVE_MAX_HONEY:,} = {percent:.1f}%")
+            
+            # Solo se >= 98%
+            if percent >= 98:
+                # Controlla se già notificato nelle ultime 4 ore
+                if not is_beehive_full_sent(self.farm_id, hive_id, timeout_hours=4):
+                    # Formatta messaggio
+                    x = hive_data.get("x")
+                    y = hive_data.get("y")
+                    
+                    if x is not None and y is not None:
+                        name = f"Alveare ({x},{y})"
+                    else:
+                        name = f"Alveare {hive_id[-6:]}"
+                    
+                    # Aggiungi info fiori
+                    flowers = hive_data.get("flowers", [])
+                    flower_info = ""
+                    if flowers and len(flowers) > 0:
+                        # Nome primo fiore
+                        first_flower = flowers[0] if isinstance(flowers[0], dict) else {}
+                        flower_name = first_flower.get("name", "")
+                        if flower_name:
+                            flower_info = f" con {flower_name}"
+                        else:
+                            flower_info = f" con {len(flowers)} fiore{'i' if len(flowers) > 1 else ''}"
+                    
+                    results.append({
+                        "type": "beehive_full",
+                        "name": f"{name}{flower_info} al {percent:.1f}%",
+                        "count": 1,
+                        "time_left_ms": 0
+                    })
+                    
+                    mark_beehive_full_sent(self.farm_id, hive_id)
+                    log.info(f"🍯 ALVEARE PIENO NOTIFICATO: {name} al {percent:.1f}%")
+                else:
+                    log.debug(f"Alveare {hive_id[-6:]} già notificato nelle ultime 4 ore")
+            elif percent > 90:  # Log per debug se quasi pieno
+                log.info(f"⚠️ Alveare {hive_id[-6:]}: {percent:.1f}% (quasi pieno)")
+            else:
+                log.debug(f"Alveare {hive_id[-6:]}: {percent:.1f}%")
+        
+        log.info(f"✅ Check alveari completato: {len(results)} da notificare")
+        return results
+    
+    def _check_timed_items(self, payload: Dict, now_ms: int) -> List[Dict]:
+        """
+        Controlla tutti gli item con timer (crops, fruits, trees, ecc.)
+        PRE-NOTIFICA: timing dinamico basato su tempo di crescita
+        """
+        from tempo import (
+            _future_crops, _future_fruit, _future_animals,
+            _future_cooking, _future_compost, _future_minerals,
+            _future_trees, _future_flowers, _future_beehives
+        )
+        from config import GROWTH_MS
+        
+        results = []
+        
+        # Mappa: funzione -> tipo
+        checkers = [
+            (_future_crops, "crops"),
+            (_future_fruit, "fruits"),
+            (_future_animals, "animals"),
+            (_future_cooking, "cooking"),
+            (_future_compost, "compost"),
+            (_future_minerals, "minerals"),
+            (_future_trees, "trees"),
+            (_future_flowers, "flowers"),
+            (_future_beehives, "beehives"),
+        ]
+        
+        for check_func, item_type in checkers:
+            items = check_func(payload, now_ms)
+            
+            for ready_ms, name in items:
+                time_left_ms = ready_ms - now_ms
+                
+                # Calcola soglia dinamica basata su tempo di crescita
+                growth_time_ms = GROWTH_MS.get(name, 0)
+                
+                if growth_time_ms > 0 and growth_time_ms < PRE_NOTICE_SECONDS * 1000:
+                    # Item veloce: notifica al 50% del tempo
+                    min_threshold = max(15000, growth_time_ms * 0.5)
+                else:
+                    # Item normale: notifica 15 secondi prima
+                    min_threshold = 15000
+                
+                # PRE-NOTIFICA: finestra dinamica
+                if min_threshold <= time_left_ms <= PRE_NOTICE_SECONDS * 1000:
+                    # Usa ready_ms per bucket, non now_ms
+                    time_bucket = ready_ms // 180000  # Bucket di 3 minuti
+                    notif_key = f"{item_type}:{name}:{time_bucket}"
+                    
+                    if not self._was_notified(notif_key):
+                        results.append({
+                            "type": item_type,
+                            "name": name,
+                            "count": 1,
+                            "time_left_ms": time_left_ms
+                        })
+                        
+                        self._mark_notified(notif_key, now_ms)
+        
+        # Raggruppa per tipo+nome (somma count)
+        grouped = {}
+        for item in results:
+            key = (item["type"], item["name"])
+            if key not in grouped:
+                grouped[key] = item.copy()
+            else:
+                grouped[key]["count"] += item["count"]
+        
+        return list(grouped.values())
+    
+    def _was_notified(self, key: str) -> bool:
+        """Controlla se questa notifica è già stata inviata"""
+        return key in self._state["sent_notifications"]
+    
+    def _mark_notified(self, key: str, timestamp_ms: int):
+        """Marca notifica come inviata"""
+        self._state["sent_notifications"][key] = timestamp_ms
+        from persistent_state import save_state
+        save_state(f"notifications_{self.farm_id}", self._state)
+    
+    def _cleanup_old_notifications(self, now_ms: int):
+        """Rimuovi notifiche più vecchie di 3 minuti"""
+        cutoff = now_ms - (3 * 60 * 1000)
+        to_remove = [k for k, v in self._state["sent_notifications"].items() if v < cutoff]
+        
+        for key in to_remove:
+            del self._state["sent_notifications"][key]
+        
+        if to_remove:
+            from persistent_state import save_state
+            save_state(f"notifications_{self.farm_id}", self._state)
+    
+    async def _send_notifications(self, notifications: List[Dict], payload: Dict):
+        """Costruisce e invia le notifiche"""
+        if not notifications:
+            return
+        
+        log.info(f"📤 Invio {len(notifications)} notifiche per farm {self.farm_id}")
+        
+        # Ordina per priorità: immediate prima, poi per tempo rimanente
+        notifications.sort(key=lambda x: (x["time_left_ms"] > 0, x["time_left_ms"]))
+        
+        # Costruisci messaggio
+        message = self._build_message(notifications, payload)
+        
+        # Invia a tutte le chat
+        for chat_id in self.chat_ids:
+            try:
+                await self.bot_send(chat_id, message)
+                log.info(f"✅ Notifica inviata a chat {chat_id}")
+            except Exception as e:
+                log.error(f"❌ Errore invio a chat {chat_id}: {e}")
+    
+    def _build_message(self, notifications: List[Dict], payload: Dict) -> str:
+        """Costruisce il messaggio formattato"""
+        # Emoticon per tipo
+        emoji_map = {
+            "crops": "🌱",
+            "fruits": "🍎",
+            "animals": "🐾",
+            "cooking": "👨‍🍳",
+            "compost": "♻️",
+            "minerals": "⛏️",
+            "trees": "🌳",
+            "flowers": "🌼",
+            "bee_swarm": "🐝",
+            "mutation": "🧬",
+            "beehive_full": "🍯"
+        }
+        
+        lines = []
+        
+        for notif in notifications:
+            item_type = notif["type"]
+            name = notif["name"]
+            count = notif["count"]
+            time_left_ms = notif["time_left_ms"]
+            
+            emoji = emoji_map.get(item_type, "⏰")
+            
+            # Override emoji per Bee nel nome
+            if "Bee" in name and item_type not in ["bee_swarm","Beetroot"]:
+                emoji = "🍯"
+            
+            # Costruisci riga
+            if time_left_ms == 0:
+                # Notifica immediata
+                if count > 1:
+                    line = f"{emoji} {count} {name}"
+                else:
+                    line = f"{emoji} {name}"
+            else:
+                # Pre-notifica con countdown
+                eta = self._format_time(time_left_ms)
+                if count > 1:
+                    line = f"{emoji} {count} {name} pronto tra {eta}"
+                else:
+                    line = f"{emoji} {name} pronto tra {eta}"
+            
+            lines.append(line)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def _format_time(ms: int) -> str:
+        """Formatta millisecondi in stringa leggibile"""
+        secs = max(0, ms // 1000)
+        m, s = divmod(secs, 60)
+        h, m = divmod(m, 60)
+        
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m {s}s" if s else f"{m}m"
+        return f"{s}s"
